@@ -104,6 +104,10 @@ Tek bir Mac'te ölçülen değerler:
 | Boşta CPU | 0 |
 | İkili dosya | Yaklaşık 360 KB |
 
+Açık her Claude Code oturumu kendi `safari-mcp` sürecini çalıştırır; Etkinlik Monitörü'nde birden fazla görünmesi olağandır ve süreç, oturum kapanınca çıkar.
+
+Eski derlemelerde boşta bekleyen süreç, başka bir uygulamaya geçildikten kısa süre sonra Etkinlik Monitörü'nde "Yanıt Vermiyor" olarak görünürdü. Bu yalnızca bir etiketti, araç çağrıları çalışmaya devam ediyordu. Güncel sürümde düzeltildi; hâlâ görüyorsan yeniden derle ve Claude Code oturumlarını yeniden başlat.
+
 ## Sınanma durumu
 
 Sunucu, küçük bir modelin (Claude Haiku) araçları yalnızca açıklamalarından kullanarak gerçek sitelerde görev yaptığı beş turla sınandı: Wikipedia, Hacker News, MDN, GitHub, DuckDuckGo, W3Schools, httpbin formları ve TodoMVC (React ve Vue). Son regresyon turunda sayfayı değiştiren 28 çağrının hepsinde bildirilen sayfa ile ardından okunan sayfa aynıydı.
