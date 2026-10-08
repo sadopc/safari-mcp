@@ -32,6 +32,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t
 
 The server is registered at user scope (`claude mcp add --scope user safari -- <path>/.build/release/safari-mcp`). A running Claude Code session keeps the binary it started with: `mcp__safari__*` tools in the current session do not reflect a rebuild. Test a new build by piping into it, not through those tools.
 
+The page agent is injected once per document and never replaced, so a page that already carries `window.__smcp` keeps the old agent after a rebuild. Reload the page (or open a new tab) before judging a change to `PageAgent.swift`.
+
+Refs (`e12`) are assigned in scan order and differ between page loads; never hard-code one in a test sequence, take it from a `read` in the same session.
+
 Real-page behaviour can only be tested against the user's live Safari. Open your own tab with `tabs new`, work only there, and close it afterwards; the user is browsing in the same window.
 
 ## Architecture
@@ -77,6 +81,10 @@ Injected once per document (`window.__smcp`), then each call is one small Apple 
 Capture uses ScreenCaptureKit in a child process: the server re-executes itself as `safari-mcp --grab <json>` and kills it after 6 s. A capture that never calls back blocks all later captures from processes of the same executable, so it must stay out of the long-lived server. macOS does not render windows on an inactive Space; when the window is not on screen, `screenshot` raises Safari briefly and then reactivates the previous app.
 
 `Input.swift` sends real mouse/keyboard events via CGEvent for `os: true`. It needs Accessibility permission, raises Safari, and maps viewport coordinates to the screen through the page's scroll area found with the Accessibility API. Typed events must clear modifier flags, or a preceding key combo (cmd+a) leaks into them.
+
+## Repository
+
+Hosted at `github.com/sadopc/safari-mcp` (private), default branch `main`. `README.md` is user-facing and in Turkish; keep its "Sınırlar" (limits) and "Sınanma durumu" (what was tested) sections honest when behaviour changes.
 
 ## Design constraints
 
