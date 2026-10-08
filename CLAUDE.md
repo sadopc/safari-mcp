@@ -76,7 +76,7 @@ Injected once per document (`window.__smcp`), then each call is one small Apple 
 
 Capture uses ScreenCaptureKit in a child process: the server re-executes itself as `safari-mcp --grab <json>` and kills it after 6 s. A capture that never calls back blocks all later captures from processes of the same executable, so it must stay out of the long-lived server. macOS does not render windows on an inactive Space; when the window is not on screen, `screenshot` raises Safari briefly and then reactivates the previous app.
 
-`Input.swift` (real mouse/keyboard via CGEvent, used for `os: true`) has not been exercised against real pages.
+`Input.swift` sends real mouse/keyboard events via CGEvent for `os: true`. It needs Accessibility permission, raises Safari, and maps viewport coordinates to the screen through the page's scroll area found with the Accessibility API. Typed events must clear modifier flags, or a preceding key combo (cmd+a) leaks into them.
 
 ## Design constraints
 

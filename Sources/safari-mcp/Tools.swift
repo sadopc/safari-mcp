@@ -546,12 +546,12 @@ final class Tools {
         case "dblclick": Input.click(try needPoint(), count: 2)
         case "hover": Input.move(try needPoint())
         case "type", "fill":
-            if let point { Input.click(point); usleep(80_000) }
+            if let point { Input.click(point); usleep(200_000) }
             if action == "fill" { try Input.key("cmd+a") }
             Input.type(text)
         case "key":
             guard let k = a["key"] as? String else { throw ToolError("key required") }
-            if let point { Input.click(point); usleep(80_000) }
+            if let point { Input.click(point); usleep(200_000) }
             try Input.key(k)
         case "scroll":
             let dy = (a["dy"] as? Double).map { Int($0) } ?? Int(ih * 0.8)
@@ -560,7 +560,8 @@ final class Tools {
             throw ToolError("\(action) has no os mode; drop os:true.")
         }
         verifiedURL = verified
-        return ("\(action) sent as real input", env)
+        let what = (g["d"] as? String).map { " on " + $0 } ?? ""
+        return ("real \(action)\(what)", env)
     }
 
     private func js(_ a: [String: Any]) throws -> String {

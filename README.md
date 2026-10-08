@@ -58,7 +58,7 @@ Sunucunun açtığı sekmeler arka planda açılır.
 
 ## Tıklama ve yazma
 
-Varsayılan yol sayfa içi olaylardır: Safari arka planda kalır, imleç sende kalır. `os: true` gerçek fare ve klavye olayı gönderir; Erişilebilirlik izni ister ve Safari'yi öne getirir. Sayfa içi olayları yok sayan siteler için düşünülmüştür.
+Varsayılan yol sayfa içi olaylardır: Safari arka planda kalır, imleç sende kalır. `os: true` gerçek fare ve klavye olayı gönderir; Erişilebilirlik izni ister ve Safari'yi öne getirir. Sayfa içi olayları yok sayan siteler ve üzerine gelince (CSS `:hover`) beliren denetimler için gerekir. Çalışırken imleci kullanır; tıklamadan sonra imleci eski yerine koyar, `hover` sonrasında ise öğenin üzerinde bırakır.
 
 ## Ekran görüntüsü
 
@@ -74,7 +74,6 @@ Yakalama ayrı, kısa ömürlü bir yardımcı süreçte yapılır; 6 saniyede b
 - iframe içerikleri ve kapalı shadow DOM okunmaz.
 - Sayfa `alert` gibi bir iletişim kutusu gösterirken çağrılar zaman aşımına uğrar.
 - HTTP durum kodu (404 gibi) bildirilmez; Safari'nin hiç açamadığı adresler hata döner.
-- `os: true` yolu gerçek kullanımda sınanmadı.
 
 ## Test
 

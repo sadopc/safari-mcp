@@ -31,7 +31,7 @@ enum PageAgent {
         return clip(el.name||el.id||'',k)}
       if(t==='IMG')return clip(el.alt||el.title||'',k);
       var x=el.innerText||el.textContent||el.title;
-      if(!x||!x.trim()){var im=el.querySelector('img[alt]');x=(im&&im.alt)||(el.getAttribute('href')||'').split(/[?#]/)[0].split('/').filter(Boolean).pop()||''}
+      if(!x||!x.trim()){var im=el.querySelector('img[alt]');x=(im&&im.alt)||(el.getAttribute('href')||'').split(/[?#]/)[0].split('/').filter(Boolean).pop()||el.id||String(el.getAttribute('class')||'').split(/\s+/)[0]||''}
       return clip(x,k)}
     function state(el){var t=el.tagName,s='';
       if(t==='INPUT'||t==='TEXTAREA'||t==='SELECT'){var y=(el.type||'').toLowerCase();
@@ -93,7 +93,7 @@ enum PageAgent {
       var off=a.offset||0,max=a.max_chars||6000,tot=body.length,cut=body.slice(off,off+max);
       if(off+max<tot){var nl=cut.lastIndexOf('\n');if(nl>max*0.6)cut=cut.slice(0,nl);cut+='\n\u2026 '+(tot-off-cut.length)+' more chars; offset='+(off+cut.length)}
       var de=document.documentElement;
-      return clip(document.title,80)+' | '+location.href.slice(0,200)+' | scroll '+Math.round(scrollY)+'/'+Math.max(0,de.scrollHeight-innerHeight)+(document.readyState==='complete'?'':' | still loading')+'\n'+cut}
+      return(document.title?clip(document.title,80)+' | ':'')+location.href.slice(0,200)+' | scroll '+Math.round(scrollY)+'/'+Math.max(0,de.scrollHeight-innerHeight)+(document.readyState==='complete'?'':' | still loading')+'\n'+cut}
 
     function deep(x,y){var e=document.elementFromPoint(x,y);while(e&&e.shadowRoot){var n=e.shadowRoot.elementFromPoint(x,y);if(!n||n===e)break;e=n}return e}
     function inside(el,c){for(;c;c=c.parentNode||c.host)if(c===el)return true;return false}
@@ -170,7 +170,7 @@ enum PageAgent {
         case'scroll':return scroll(a);
         default:throw new Error('unknown action '+a.action)}}
     function geom(a){var t=target(a),g={iw:innerWidth,ih:innerHeight};
-      if(t){g.x=t.x;g.y=t.y;if(t.r)g.r=[t.r.left,t.r.top,t.r.width,t.r.height]}return g}
+      if(t){g.x=t.x;g.y=t.y;g.d=desc(t.el);if(t.r)g.r=[t.r.left,t.r.top,t.r.width,t.r.height]}return g}
 
     function fmt(v){if(typeof v==='string')return v;if(v instanceof Error)return v.name+': '+v.message;try{return JSON.stringify(v)}catch(e){return String(v)}}
     function push(arr,x){arr.push(x);if(arr.length>300)arr.shift()}

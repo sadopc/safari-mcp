@@ -46,9 +46,12 @@ enum Input {
                 for down in [true, false] {
                     let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down)
                     e?.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                    // Without this, a modifier from a key combo just before (cmd+a) still applies.
+                    e?.flags = []
                     e?.post(tap: tap)
+                    usleep(4_000)
                 }
-                usleep(6_000)
+                usleep(8_000)
                 i += 20
             }
         }
@@ -71,6 +74,8 @@ enum Input {
             e?.post(tap: tap)
             usleep(10_000)
         }
+        // Let the app handle the key before more input arrives.
+        usleep(40_000)
     }
 
     /// `combo` is like "Enter", "cmd+a", "shift+Tab".
