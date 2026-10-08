@@ -1,0 +1,698 @@
+import Foundation
+
+final class Tools {
+    // Descriptions are sent to the model every session; keep them terse.
+    static let defs: [[String: Any]] = [
+        tool("tabs", "List, open, close or select Safari tabs. Ids like t3 stay valid while the tab is open; * marks the visible tab of a window.", [
+            "action": ["type": "string", "enum": ["list", "new", "close", "select"]],
+            "url": str, "tab": str,
+        ]),
+        tool("navigate", "Load a URL, or back / forward / reload, and wait for the page.", ["url": str, "tab": str], ["url"]),
+        tool("read", "Read the page. interactive (default): visible controls with refs. all: adds headings and text. text: readable text only. query finds elements and text by words on the whole page.", [
+            "mode": ["type": "string", "enum": ["interactive", "all", "text"]],
+            "query": str, "ref": str, "selector": str,
+            "full": ["type": "boolean", "description": "include off-screen elements"],
+            "max_chars": int, "offset": int, "tab": str,
+        ]),
+        tool("act", "Act on an element by ref (from read) or x,y viewport px. text is for type/fill/select; key is like Enter or cmd+a; scroll dy is px, negative = up.", [
+            "action": ["type": "string", "enum": ["click", "dblclick", "hover", "type", "fill", "select", "key", "scroll"]],
+            "ref": str, "x": num, "y": num, "text": str, "key": str, "dy": num,
+            "os": ["type": "boolean", "description": "real mouse/keyboard; use when the page ignores the default synthetic events"],
+            "tab": str,
+        ], ["action"]),
+        tool("js", "Run JavaScript in the page. Code is an async function body: use return. 15s limit.", [
+            "code": str, "max_chars": int, "tab": str,
+        ], ["code"]),
+        tool("screenshot", "JPEG of the viewport, an element (ref) or a region [x,y,w,h]. Costs far more tokens than read.", [
+            "ref": str, "region": ["type": "array", "items": num], "max_width": int, "tab": str,
+        ]),
+        tool("logs", "Console or network lines captured since the first logs call on this page.", [
+            "kind": ["type": "string", "enum": ["console", "network"]],
+            "pattern": str, "limit": int, "clear": ["type": "boolean"], "tab": str,
+        ]),
+        tool("batch", "Run several tool calls in order in one round trip; stops at the first error.", [
+            "steps": ["type": "array", "items": ["type": "object", "properties": ["tool": str, "args": ["type": "object"]], "required": ["tool"]]],
+        ], ["steps"]),
+    ]
+    static let names = Set(defs.compactMap { $0["name"] as? String })
+
+    private static let str: [String: Any] = ["type": "string"]
+    private static let int: [String: Any] = ["type": "integer"]
+    private static let num: [String: Any] = ["type": "number"]
+
+    private static func tool(_ name: String, _ desc: String, _ props: [String: Any], _ required: [String] = []) -> [String: Any] {
+        var schema: [String: Any] = ["type": "object", "properties": props]
+        if !required.isEmpty { schema["required"] = required }
+        return ["name": name, "description": desc, "inputSchema": schema]
+    }
+
+    /// A tab we know about. `id` is ours and stable; `pos` is where Safari has it now.
+    private struct Tab {
+        let id: Int
+        var pos: TabRef
+        var url: String
+        var title: String
+        var visible: Bool
+        /// Stamped into the page's agent once we have worked in the tab.
+        var handle: String?
+    }
+
+    private lazy var safari = Safari()
+    private var tabs: [Int: Tab] = [:]
+    /// Ids in Safari's order: windows front to back, tabs left to right.
+    private var order: [Int] = []
+    private var counts: [Int: Int] = [:]
+    private var nextTab = 1
+    private var synced = false
+    /// Tab used when a call does not name one.
+    private var current: Int?
+    /// Set once the default tab went away; from then on calls must name a tab rather than
+    /// fall back to whatever the user happens to be looking at.
+    private var defaultLost = false
+    private let session = String(UInt32.random(in: 0...UInt32.max), radix: 36)
+    private var seq = 0
+    /// URL the last successful `exec` verified before it ran.
+    private var verifiedURL = ""
+
+    func call(_ name: String, _ a: [String: Any]) throws -> [Content] {
+        switch name {
+        case "tabs": return [.text(try tabsTool(a))]
+        case "navigate": return [.text(try navigate(a))]
+        case "read": return [.text(try page("read", a, ["mode", "query", "ref", "selector", "full", "max_chars", "offset"]))]
+        case "act": return [.text(try act(a))]
+        case "js": return [.text(try js(a))]
+        case "screenshot": return try screenshot(a)
+        case "logs": return [.text(try page("logs", a, ["kind", "pattern", "limit", "clear"]))]
+        case "batch": return try batch(a)
+        default: throw ToolError("Unknown tool \(name)")
+        }
+    }
+
+    // MARK: tab tracking
+
+    private func nextID(_ prefix: String) -> String {
+        seq += 1
+        return "\(prefix)\(session)\(seq)"
+    }
+
+    private func clip(_ s: String, _ n: Int) -> String { s.count > n ? String(s.prefix(n - 1)) + "…" : s }
+
+    private func gone(_ id: Int) -> ToolError {
+        ToolError("Tab t\(id) is gone (closed, or changed outside this session); run tabs for current ids.")
+    }
+
+    private func sameHost(_ a: String, _ b: String) -> Bool {
+        guard let ha = URLComponents(string: a)?.host, let hb = URLComponents(string: b)?.host else { return false }
+        return ha == hb
+    }
+
+    /// Longest common subsequence, as index pairs.
+    private func lcs(_ a: [String], _ b: [String]) -> [(Int, Int)] {
+        guard !a.isEmpty, !b.isEmpty else { return [] }
+        var len = Array(repeating: Array(repeating: 0, count: b.count + 1), count: a.count + 1)
+        for i in stride(from: a.count - 1, through: 0, by: -1) {
+            for j in stride(from: b.count - 1, through: 0, by: -1) {
+                len[i][j] = a[i] == b[j] ? len[i + 1][j + 1] + 1 : max(len[i + 1][j], len[i][j + 1])
+            }
+        }
+        var pairs: [(Int, Int)] = []
+        var i = 0, j = 0
+        while i < a.count && j < b.count {
+            if a[i] == b[j] { pairs.append((i, j)); i += 1; j += 1 } else if len[i + 1][j] >= len[i][j + 1] { i += 1 } else { j += 1 }
+        }
+        return pairs
+    }
+
+    /// Re-reads Safari's tabs and carries our ids over to wherever each tab is now.
+    /// Tabs keep their order unless moved, so matching the URL sequence per window finds
+    /// most of them; what is left is matched by the handle in the page, or dropped.
+    private func sync() throws {
+        let list = try safari.listTabs()
+        var result: [Int: Tab] = [:]
+        var slot = [Int?](repeating: nil, count: list.count)
+
+        func assign(_ old: Tab, _ li: Int) {
+            var t = old
+            t.pos = list[li].ref
+            t.url = list[li].url
+            t.title = list[li].title
+            t.visible = list[li].current
+            result[t.id] = t
+            slot[li] = t.id
+        }
+
+        var wids: [Int] = []
+        for t in list where !wids.contains(t.ref.wid) { wids.append(t.ref.wid) }
+        for wid in wids {
+            let news = list.indices.filter { list[$0].ref.wid == wid }
+            let olds = tabs.values.filter { $0.pos.wid == wid }.sorted { $0.pos.idx < $1.pos.idx }
+            var po = 0, pn = 0
+            for (oi, ni) in lcs(olds.map(\.url), news.map { list[$0].url }) + [(olds.count, news.count)] {
+                let go = Array(olds[po..<oi]), gn = Array(news[pn..<ni])
+                if go.count == gn.count {
+                    // Same place, new URL: the tab navigated. For a tab we have worked in,
+                    // only take that on trust within one site; otherwise ask the page below.
+                    for k in go.indices where go[k].handle == nil || sameHost(go[k].url, list[gn[k]].url) { assign(go[k], gn[k]) }
+                }
+                if oi < olds.count { assign(olds[oi], news[ni]) }
+                po = oi + 1
+                pn = ni + 1
+            }
+        }
+
+        let looseOld = tabs.values.filter { result[$0.id] == nil && $0.handle != nil }.sorted { $0.id < $1.id }
+        if !looseOld.isEmpty {
+            var probed: [Int: String] = [:]
+            for old in looseOld {
+                for li in list.indices where slot[li] == nil {
+                    if probed[li] == nil {
+                        probed[li] = (try? safari.js(list[li].ref, "window.__smcp?__smcp.h||'':''", Expect(count: -1, url: nil)))?.result ?? ""
+                    }
+                    if probed[li] == old.handle { assign(old, li); break }
+                }
+            }
+        }
+        for li in list.indices where slot[li] == nil {
+            let t = Tab(id: nextTab, pos: list[li].ref, url: list[li].url, title: list[li].title, visible: list[li].current, handle: nil)
+            nextTab += 1
+            result[t.id] = t
+            slot[li] = t.id
+        }
+
+        tabs = result
+        order = slot.compactMap { $0 }
+        counts = [:]
+        for t in list { counts[t.ref.wid, default: 0] += 1 }
+        synced = true
+        if let c = current, tabs[c] == nil {
+            current = nil
+            defaultLost = true
+        }
+    }
+
+    private func resolve(_ a: [String: Any]) throws -> Int {
+        if let raw = a["tab"] {
+            let s = "\(raw)"
+            guard let id = Int(s.hasPrefix("t") ? String(s.dropFirst()) : s) else {
+                throw ToolError("Bad tab id \(s); use an id from tabs, like t3.")
+            }
+            if tabs[id] == nil { try sync() }
+            guard tabs[id] != nil else { throw gone(id) }
+            current = id
+            defaultLost = false
+            return id
+        }
+        if let c = current {
+            guard tabs[c] != nil else { throw gone(c) }
+            return c
+        }
+        if defaultLost { throw ToolError("The default tab was closed; pass tab (ids from tabs).") }
+        try sync()
+        guard let front = order.first(where: { tabs[$0]?.visible == true }) else { throw ToolError("Safari has no open tab; use tabs new.") }
+        current = front
+        return front
+    }
+
+    private func expect(_ t: Tab, url: Bool = true) -> Expect {
+        Expect(count: counts[t.pos.wid] ?? -1, url: url ? t.url : nil)
+    }
+
+    /// Runs `op` on the tab's position; Safari refuses if the tab is not what we expect,
+    /// in which case positions are re-read and the call retried.
+    private func guardedOp(_ id: Int, _ op: (TabRef, Expect) throws -> Bool) throws {
+        for _ in 0..<3 {
+            guard let t = tabs[id] else { throw gone(id) }
+            if try op(t.pos, expect(t)) { return }
+            try sync()
+        }
+        throw ToolError("Tab t\(id) keeps changing; run tabs.")
+    }
+
+    /// Runs JavaScript in the tab after Safari has verified it is the tab we mean.
+    private func exec(_ id: Int, _ code: String) throws -> String {
+        for _ in 0..<3 {
+            guard let t = tabs[id] else { throw gone(id) }
+            if let r = try safari.js(t.pos, code, expect(t)) {
+                verifiedURL = t.url
+                tabs[id]?.url = r.url
+                return r.result
+            }
+            try sync()
+        }
+        throw ToolError("Tab t\(id) keeps changing; run tabs.")
+    }
+
+    /// JavaScript without the URL check, for polling while a navigation is in flight.
+    private func poll(_ id: Int, _ code: String) -> (url: String, result: String)? {
+        guard let t = tabs[id] else { return nil }
+        if let r = try? safari.js(t.pos, code, expect(t, url: false)) {
+            tabs[id]?.url = r.url
+            return r
+        }
+        try? sync()
+        return nil
+    }
+
+    /// Runs `body(handle)` inside the page with the agent present and the handle verified.
+    /// `body` is JS statements that return a JSON envelope string.
+    private func agent(_ id: Int, _ body: (String) -> String) throws -> [String: Any] {
+        for _ in 0..<4 {
+            let h = tabs[id]?.handle
+            let r = try exec(id, "(function(){if(!window.__smcp)return '\(PageAgent.absent)';\(body(h ?? ""))})()")
+            if r == PageAgent.absent {
+                let nh = h ?? nextID("h")
+                guard try exec(id, PageAgent.source + ";__smcp.h=\(jsonString(nh));'ok'") == "ok" else {
+                    throw ToolError("Could not run script in this tab (still loading, showing a dialog, or not a web page).")
+                }
+                tabs[id]?.handle = nh
+                continue
+            }
+            guard !r.isEmpty else { throw ScriptEmpty() }
+            guard let env = (try? JSONSerialization.jsonObject(with: Data(r.utf8))) as? [String: Any] else {
+                throw ToolError("Unexpected reply from page: \(clip(r, 120))")
+            }
+            if let m = env["m"] as? String {
+                if tabs.values.contains(where: { $0.handle == m && $0.id != id }) {
+                    // This position holds another tab we know: tabs were reordered. Drop what
+                    // we believed about this window and let sync find tabs by their handles.
+                    guard let wid = tabs[id]?.pos.wid else { throw gone(id) }
+                    for t in tabs.values where t.pos.wid == wid {
+                        if t.handle == nil { tabs[t.id] = nil } else { tabs[t.id]?.url = "?" }
+                    }
+                    try sync()
+                    guard tabs[id] != nil else { throw gone(id) }
+                } else {
+                    // Agent left by an earlier session: adopt it.
+                    let nh = h ?? nextID("h")
+                    _ = try exec(id, "__smcp.h=\(jsonString(nh));'ok'")
+                    tabs[id]?.handle = nh
+                }
+                continue
+            }
+            if let e = env["e"] as? String { throw ToolError(e) }
+            return env
+        }
+        throw ToolError("Tab t\(id) keeps changing; run tabs.")
+    }
+
+    private func agentCall(_ id: Int, _ op: [String: Any]) throws -> [String: Any] {
+        do {
+            return try agent(id) { h in
+                var o = op
+                o["h"] = h
+                return "return __smcp.call(\(jsonString(o)))"
+            }
+        } catch is ScriptEmpty {
+            throw ToolError("The page did not respond (still loading, showing a dialog, or not a web page).")
+        }
+    }
+
+    private func pick(_ a: [String: Any], _ keys: [String]) -> [String: Any] {
+        var o: [String: Any] = [:]
+        for k in keys { if let v = a[k] { o[k] = v } }
+        return o
+    }
+
+    private func page(_ op: String, _ a: [String: Any], _ keys: [String]) throws -> String {
+        let id = try resolve(a)
+        var o = pick(a, keys)
+        o["op"] = op
+        return try agentCall(id, o)["v"] as? String ?? ""
+    }
+
+    // MARK: loading
+
+    private struct PageState {
+        /// document.readyState, or "old" for a document marked before navigating away,
+        /// or "leaving" once it has started to unload.
+        let ready: String
+        let url: String
+        /// HTTP status of the document, 0 when unknown.
+        let status: Int
+        /// False when nothing on the page has changed since the last act call.
+        let changed: Bool
+        let title: String
+        /// Safari's URL for the tab, which already shows a navigation that has not committed.
+        let tabURL: String
+
+        private func bare(_ u: String) -> String {
+            var b = u.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? u
+            if b.hasSuffix("/") { b.removeLast() }
+            return b
+        }
+
+        /// Safari is heading somewhere else but still shows this document.
+        var pending: Bool { !tabURL.isEmpty && bare(tabURL) != bare(url) && !url.hasPrefix("safari-resource:") }
+    }
+
+    /// Value of the marker put on the document we are navigating away from. Unique per
+    /// navigation, so a marked document restored by back/forward does not count as old.
+    private var mark = 0
+    private var stateJS: String {
+        "(window.__smcpOld===\(mark)?'old':window.__smcp&&__smcp.bye&&Date.now()-__smcp.bye<10000?'leaving':document.readyState)+'\\n'+location.href+'\\n'+((performance.getEntriesByType('navigation')[0]||{}).responseStatus||0)+'\\n'+(window.__smcp&&__smcp.fx===0?0:1)+'\\n'+document.title"
+    }
+
+    private func peek(_ id: Int) -> PageState? {
+        guard let r = poll(id, stateJS) else { return nil }
+        let f = r.result.split(separator: "\n", maxSplits: 4, omittingEmptySubsequences: false)
+        guard f.count == 5 else { return nil }
+        return PageState(ready: String(f[0]), url: String(f[1]), status: Int(f[2]) ?? 0, changed: f[3] != "0", title: String(f[4]), tabURL: r.url)
+    }
+
+    /// Waits for a navigation to finish. With `marked`, the old document carries a marker,
+    /// so any unmarked document is the new one; otherwise a change away from `from` is.
+    /// `stuck` means nothing happened: the marked document stayed and Safari was not
+    /// heading anywhere.
+    private func waitLoad(_ id: Int, marked: Bool, from: String?, timeout: Double, grace: Double = 1.2) -> (text: String, stuck: Bool) {
+        let start = Date()
+        var moved = false
+        var stuck = false
+        var inPage = false
+        var last: PageState?
+        while true {
+            let t = Date().timeIntervalSince(start)
+            guard tabs[id] != nil else { return ("lost track of the tab while it was loading; run tabs", false) }
+            if let s = peek(id) {
+                last = s
+                if s.ready == "old" {
+                    // Same document, new address: an in-page navigation (fragment, pushState).
+                    if let from, s.url != from { inPage = true; break }
+                    if t > grace && !s.pending { stuck = true; break }
+                } else if s.ready != "leaving" {
+                    if marked || s.url != from { moved = true }
+                    // Accept "interactive" after a few seconds: some pages never finish loading.
+                    if (s.ready == "complete" && (moved || t > grace)) || (s.ready == "interactive" && moved && t > 4) { break }
+                }
+            } else {
+                moved = true
+            }
+            if t > timeout { break }
+            usleep(t < 1 ? 60_000 : 150_000)
+        }
+        defer { mark += 1 }
+        guard let last else { return ("(page did not respond)", false) }
+        if last.ready == "old" { _ = poll(id, "delete window.__smcpOld;''") }
+        tabs[id]?.title = last.title
+        var note = ""
+        if stuck { note = " (no navigation happened)" }
+        else if last.ready == "old" && !inPage { note = " (the new page has not arrived yet)" }
+        else if last.ready != "complete" && last.ready != "old" { note = " (still loading)" }
+        if last.status >= 400 { note += " (HTTP \(last.status))" }
+        return ((last.title.isEmpty ? "" : clip(last.title, 80) + " | ") + clip(last.url, 200) + note, stuck)
+    }
+
+    // MARK: tools
+
+    private func tabsTool(_ a: [String: Any]) throws -> String {
+        switch a["action"] as? String ?? "list" {
+        case "list":
+            try sync()
+            if order.isEmpty { return "(no tabs)" }
+            var lines: [String] = []
+            var lastWid: Int?
+            for id in order {
+                guard let t = tabs[id] else { continue }
+                if let lastWid, lastWid != t.pos.wid { lines.append("-- another window --") }
+                lastWid = t.pos.wid
+                lines.append("t\(id)\(t.visible ? "*" : "") \(clip(t.title, 60)) | \(clip(t.url, 120))")
+            }
+            return lines.joined(separator: "\n")
+        case "new":
+            var url = a["url"] as? String ?? ""
+            if !url.isEmpty && !url.contains(":") { url = "https://" + url }
+            try sync()
+            let wid = current.flatMap { tabs[$0]?.pos.wid } ?? order.first.flatMap { tabs[$0]?.pos.wid }
+            let pos = try safari.newTab(in: wid, url: url)
+            try sync()
+            guard let id = tabs.values.first(where: { $0.pos == pos })?.id else { throw ToolError("Opened a tab but lost track of it; run tabs.") }
+            current = id
+            defaultLost = false
+            return "opened t\(id)" + (url.isEmpty ? "" : ": " + waitLoad(id, marked: false, from: "about:blank", timeout: 15, grace: 8).text)
+        case "close":
+            guard a["tab"] != nil else { throw ToolError("close needs an explicit tab id.") }
+            let previous = current, wasLost = defaultLost
+            let id = try resolve(a)
+            try guardedOp(id) { try safari.close($0, $1) }
+            tabs[id] = nil
+            // Closing a tab must not change which tab is the default, except to lose it.
+            current = previous == id ? nil : previous
+            defaultLost = previous == id || (previous == nil && wasLost)
+            try sync()
+            return "closed t\(id)"
+        case "select":
+            let id = try resolve(a)
+            try guardedOp(id) { try safari.select($0, $1) }
+            return "selected t\(id)"
+        default:
+            throw ToolError("action must be list, new, close or select.")
+        }
+    }
+
+    private func navigate(_ a: [String: Any]) throws -> String {
+        guard var url = a["url"] as? String, !url.isEmpty else { throw ToolError("url required") }
+        let id = try resolve(a)
+        // Mark the current document so the wait below cannot mistake it for the new one.
+        mark += 1
+        let from = try exec(id, "window.__smcpOld=\(mark);location.href")
+        switch url {
+        case "back", "forward":
+            // A history of one entry has nowhere to go; say so at once instead of waiting.
+            if try exec(id, "history.length<=1?(delete window.__smcpOld,'no'):(history.\(url)(),'')") == "no" {
+                return "no \(url) history; still on " + (tabs[id]?.url ?? "")
+            }
+        case "reload": _ = try exec(id, "location.reload();''")
+        default:
+            if !url.contains(":") { url = "https://" + url }
+            try guardedOp(id) { try safari.setURL($0, url, $1) }
+        }
+        usleep(100_000)
+        let (text, _) = waitLoad(id, marked: true, from: url == "reload" ? nil : from, timeout: 15, grace: 1.5)
+        if !["back", "forward", "reload"].contains(url), let s = peek(id), s.url.hasPrefix("safari-resource:") {
+            throw ToolError("Safari could not open \(clip(url, 120)) (\(clip(s.title, 60))); the tab now shows Safari's error page.")
+        }
+        return text
+    }
+
+    /// Reports a navigation the action caused, so the model need not look.
+    private func settle(_ id: Int, _ result: String, href: String, tabURL: String, wasReady: Bool, twice: Bool) -> String {
+        var changed = true
+        for wait: useconds_t in twice ? [120_000, 250_000] : [120_000] {
+            usleep(wait)
+            guard let s = peek(id) else { return result + " → " + waitLoad(id, marked: false, from: href, timeout: 10).text }
+            if s.url != href || s.ready == "leaving" || (wasReady && s.ready != "complete") {
+                return result + " → " + waitLoad(id, marked: false, from: href, timeout: 10).text
+            }
+            if s.tabURL != tabURL {
+                // Safari has the new address but still shows the old document: mark it and wait.
+                mark += 1
+                _ = poll(id, "if(location.href===\(jsonString(href)))window.__smcpOld=\(mark);''")
+                let (text, stuck) = waitLoad(id, marked: true, from: href, timeout: 10, grace: 1.5)
+                return stuck ? result : result + " → " + text
+            }
+            changed = s.changed
+        }
+        // Synthetic events are ignored by some pages; tell the model when nothing reacted.
+        return twice && !changed ? result + " (no change on the page yet)" : result
+    }
+
+    private func act(_ a: [String: Any]) throws -> String {
+        guard let action = a["action"] as? String else { throw ToolError("action required") }
+        let id = try resolve(a)
+        let result: String
+        let env: [String: Any]
+        if a["os"] as? Bool == true {
+            (result, env) = try osAct(id, action, a)
+        } else {
+            var o = pick(a, ["action", "ref", "x", "y", "text", "key", "dy"])
+            o["op"] = "act"
+            env = try agentCall(id, o)
+            result = env["v"] as? String ?? "ok"
+        }
+        if action == "hover" || action == "scroll" { return result }
+        return settle(id, result, href: env["u"] as? String ?? "", tabURL: verifiedURL,
+                      wasReady: env["r"] as? String == "complete", twice: action == "click" || action == "dblclick" || action == "key")
+    }
+
+    private func osAct(_ id: Int, _ action: String, _ a: [String: Any]) throws -> (String, [String: Any]) {
+        guard Input.trusted(prompt: true) else {
+            throw ToolError("Real input needs Accessibility permission for the app running this server (System Settings > Privacy & Security > Accessibility). Grant it and retry, or drop os:true.")
+        }
+        var o = pick(a, ["ref", "x", "y"])
+        o["op"] = "geom"
+        let env = try agentCall(id, o)
+        let verified = verifiedURL
+        let g = env["v"] as? [String: Any] ?? [:]
+        let iw = g["iw"] as? Double ?? 0, ih = g["ih"] as? Double ?? 0
+
+        try guardedOp(id) { try safari.raise($0, $1) }
+        guard let wid = tabs[id]?.pos.wid else { throw gone(id) }
+        var tries = 0
+        while !Capture.onScreen(wid) && tries < 20 { usleep(100_000); tries += 1 }
+        usleep(250_000)
+        let view = try Capture.viewport(wid: wid, iw: iw, ih: ih).rect
+        let z = iw > 0 ? Double(view.width) / iw : 1
+        var point: CGPoint?
+        if let x = g["x"] as? Double, let y = g["y"] as? Double {
+            point = CGPoint(x: Double(view.minX) + x * z, y: Double(view.minY) + y * z)
+        }
+        func needPoint() throws -> CGPoint {
+            guard let point else { throw ToolError("pass ref or x,y") }
+            return point
+        }
+        let text = a["text"] as? String ?? ""
+
+        switch action {
+        case "click": Input.click(try needPoint())
+        case "dblclick": Input.click(try needPoint(), count: 2)
+        case "hover": Input.move(try needPoint())
+        case "type", "fill":
+            if let point { Input.click(point); usleep(80_000) }
+            if action == "fill" { try Input.key("cmd+a") }
+            Input.type(text)
+        case "key":
+            guard let k = a["key"] as? String else { throw ToolError("key required") }
+            if let point { Input.click(point); usleep(80_000) }
+            try Input.key(k)
+        case "scroll":
+            let dy = (a["dy"] as? Double).map { Int($0) } ?? Int(ih * 0.8)
+            Input.scroll(at: point ?? CGPoint(x: view.midX, y: view.midY), dy: dy)
+        default:
+            throw ToolError("\(action) has no os mode; drop os:true.")
+        }
+        verifiedURL = verified
+        return ("\(action) sent as real input", env)
+    }
+
+    private func js(_ a: [String: Any]) throws -> String {
+        guard var code = a["code"] as? String else { throw ToolError("code required") }
+        let id = try resolve(a)
+        let slot = nextID("s")
+        var href = ""
+        func start(_ src: String) throws {
+            href = try agent(id) { h in
+                "if(__smcp.h!==\(jsonString(h)))return JSON.stringify({m:__smcp.h||''});var S=__smcp.slot('\(slot)');var u=location.href;(async function(){\(src)\n})().then(S.done,S.fail);return JSON.stringify({v:1,u:u})"
+            }["u"] as? String ?? ""
+        }
+        // A bare expression is the common case; fall back to statements if it does not parse.
+        while let last = code.last, last == ";" || last.isWhitespace { code.removeLast() }
+        let hasReturn = code.range(of: #"(^|[^.\w$])return\b"#, options: .regularExpression) != nil
+        do {
+            try start(hasReturn ? code : "return (\n\(code)\n)")
+        } catch is ScriptEmpty {
+            do {
+                try start(code)
+            } catch is ScriptEmpty {
+                let why = poll(id, "(function(){try{new Function(\(jsonString(code)))}catch(e){return e instanceof SyntaxError?String(e):''}return ''})()")?.result ?? ""
+                throw ToolError(why.isEmpty ? "The script did not run (page still loading, showing a dialog, or not a web page)." : why)
+            }
+        }
+
+        let before = verifiedURL
+        let started = Date()
+        var delay: useconds_t = 10_000
+        while Date().timeIntervalSince(started) < 15 {
+            usleep(delay)
+            delay = min(delay * 2, 250_000)
+            guard let r = poll(id, "window.__smcp?__smcp.take('\(slot)'):'{\"x\":1}'"),
+                  let env = (try? JSONSerialization.jsonObject(with: Data(r.result.utf8))) as? [String: Any] else { continue }
+            if env["p"] != nil { continue }
+            tabs[id]?.url = r.url
+            if env["x"] != nil { return "(page navigated before the script returned) " + waitLoad(id, marked: false, from: nil, timeout: 10).text }
+            if let e = env["e"] as? String { throw ToolError(clip(e, 600)) }
+            let v = env["v"] as? String ?? "undefined"
+            let max = a["max_chars"] as? Int ?? 4000
+            var out = v.count > max ? String(v.prefix(max)) + "\n… \(v.count - max) more chars" : v
+            // The script sent the tab somewhere else: wait, so the next call sees the new page.
+            var navigated = r.url != before
+            if !navigated, code.range(of: #"location|history\.|\.submit\(|\.click\(|\.open\("#, options: .regularExpression) != nil {
+                usleep(120_000)
+                if let s = peek(id) { navigated = s.tabURL != before || s.url != href || s.ready != "complete" } else { navigated = true }
+            }
+            if navigated { out += " → " + waitLoad(id, marked: false, from: href, timeout: 10, grace: 6).text }
+            return out
+        }
+        return "(still running after 15s; result discarded)"
+    }
+
+    private func screenshot(_ a: [String: Any]) throws -> [Content] {
+        let id = try resolve(a)
+        // Only the visible tab of a window can be captured.
+        try sync()
+        guard let tab = tabs[id] else { throw gone(id) }
+        if !tab.visible {
+            try guardedOp(id) { try safari.select($0, $1) }
+            usleep(350_000)
+        }
+        var o = pick(a, ["ref"])
+        o["op"] = "geom"
+        let g = try agentCall(id, o)["v"] as? [String: Any] ?? [:]
+        guard let wid = tabs[id]?.pos.wid else { throw gone(id) }
+        let iw = g["iw"] as? Double ?? 0, ih = g["ih"] as? Double ?? 0
+        let (view, bounds) = try Capture.viewport(wid: wid, iw: iw, ih: ih)
+        let z = iw > 0 ? Double(view.width) / iw : 1
+
+        var region = g["r"] as? [Double]
+        if region == nil, let r = a["region"] as? [NSNumber] { region = r.map(\.doubleValue) }
+        var crop = view
+        var origin = (x: 0.0, y: 0.0)
+        if let r = region, r.count == 4 {
+            crop = CGRect(x: Double(view.minX) + r[0] * z, y: Double(view.minY) + r[1] * z, width: r[2] * z, height: r[3] * z).intersection(view)
+            origin = (r[0], r[1])
+        }
+        let maxWidth = a["max_width"] as? Int ?? 1024
+        let shot: (data: Data, width: Int, height: Int)
+        var raised = false
+        if Capture.onScreen(wid) {
+            shot = try Capture.jpeg(wid: wid, bounds: bounds, crop: crop, maxWidth: maxWidth)
+        } else {
+            // macOS only renders windows on the active Space. Show Safari for a moment, then
+            // go back and let the Space switch finish so the next capture is not mid-animation.
+            let front = safari.frontApp()
+            try guardedOp(id) { try safari.raise($0, $1) }
+            defer {
+                if let front, !front.contains("Safari") {
+                    safari.activate(app: front)
+                    usleep(700_000)
+                }
+            }
+            var tries = 0
+            while !Capture.onScreen(wid) && tries < 20 { usleep(100_000); tries += 1 }
+            usleep(250_000)
+            shot = try Capture.jpeg(wid: wid, bounds: bounds, crop: crop, maxWidth: maxWidth)
+            raised = true
+        }
+
+        // Tell the model how image pixels map to the viewport px that act expects.
+        let k = Double(crop.width) / z / Double(shot.width)
+        var note = "\(shot.width)x\(shot.height)"
+        if abs(k - 1) > 0.01 || origin.x != 0 || origin.y != 0 {
+            note += "; viewport px = image px × \(String(format: "%.2f", k))"
+            if origin.x != 0 || origin.y != 0 { note += " + (\(Int(origin.x)),\(Int(origin.y)))" }
+        }
+        if raised { note += "; Safari was brought forward briefly to capture" }
+        return [.image(base64: shot.data.base64EncodedString(), mime: "image/jpeg"), .text(note)]
+    }
+
+    private func batch(_ a: [String: Any]) throws -> [Content] {
+        guard let steps = a["steps"] as? [[String: Any]], !steps.isEmpty else { throw ToolError("steps required") }
+        var out: [Content] = []
+        func add(_ line: String) {
+            if case .text(let prev)? = out.last { out[out.count - 1] = .text(prev + "\n" + line) } else { out.append(.text(line)) }
+        }
+        for (i, step) in steps.enumerated() {
+            guard let name = step["tool"] as? String, name != "batch", Tools.names.contains(name) else {
+                add("[\(i + 1)] unknown tool; stopped")
+                break
+            }
+            do {
+                for c in try call(name, step["args"] as? [String: Any] ?? [:]) {
+                    if case .text(let t) = c { add("[\(i + 1)] \(name): \(t)") } else { out.append(c) }
+                }
+            } catch let e as ToolError {
+                add("[\(i + 1)] \(name) failed: \(e.msg); stopped")
+                break
+            }
+        }
+        return out
+    }
+}
