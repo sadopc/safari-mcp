@@ -40,7 +40,7 @@ Real-page behaviour can only be tested against the user's live Safari. Open your
 
 ## Architecture
 
-Request path: `main.swift` (line loop on stdin) → `MCP.swift` (`Server`: JSON-RPC, lifecycle, tool errors as `isError`) → `Tools.swift` (the 8 tools and all tab/navigation logic) → `Safari.swift` (Apple Events) → `PageAgent.swift` (JS that runs inside the page).
+Request path: `main.swift` (stdin read on a side thread, requests handled in order on the main thread, whose run loop must stay free when idle or macOS reports the process as "Not Responding") → `MCP.swift` (`Server`: JSON-RPC, lifecycle, tool errors as `isError`) → `Tools.swift` (the 8 tools and all tab/navigation logic) → `Safari.swift` (Apple Events) → `PageAgent.swift` (JS that runs inside the page).
 
 ### Safari bridge (`Safari.swift`)
 
