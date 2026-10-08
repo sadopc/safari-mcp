@@ -128,3 +128,7 @@ Tests/smoke.sh
 ```
 
 Protokol düzeyinde bir duman testidir; Safari izni gerektirmez.
+
+## Lisans
+
+[MIT](LICENSE)
