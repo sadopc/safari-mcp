@@ -84,7 +84,7 @@ Capture uses ScreenCaptureKit in a child process: the server re-executes itself 
 
 ## Repository
 
-Hosted at `github.com/sadopc/safari-mcp` (private), default branch `main`. `README.md` is user-facing and in Turkish; keep its "Sınırlar" (limits) and "Sınanma durumu" (what was tested) sections honest when behaviour changes.
+Hosted at `github.com/sadopc/safari-mcp` (public), default branch `main`. `README.md` is user-facing and in Turkish; keep its "Sınırlar" (limits) and "Sınanma durumu" (what was tested) sections honest when behaviour changes.
 
 ## Design constraints
 
